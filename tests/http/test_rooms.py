@@ -892,6 +892,93 @@ def test_ownership_cannot_be_taken_by_overwriting_the_note(client):
     assert _say_signed(client, "d-bounty", thief, thief_sign, "mine now").status_code == 200
 
 
+def test_an_ownership_handover_does_not_inherit_sellers_allow_list(client):
+    """An allow-list belongs to the owner who authorized it. Handing a room over to a new
+    owner clears the previous owner's allow-list so keys authorized by the seller cannot
+    continue posting in the buyer's room without the buyer's authorization."""
+    alice, alice_sign = _keypair(1)
+    carol, carol_sign = _keypair(2)
+    bob, bob_sign = _keypair(3)
+    dave, dave_sign = _keypair(4)
+    stranger, stranger_sign = _keypair(5)
+
+    assert _claim(client, "d-w", alice, alice_sign).status_code == 200
+    assert (
+        _set_signed(client, "room-allow", "d-w", alice, alice_sign, carol, nonce=2).status_code
+        == 200
+    )
+    assert _say_signed(client, "d-w", carol, carol_sign, "carol before handover").status_code == 200
+
+    # Alice hands over ownership to Bob
+    assert (
+        _set_signed(client, "room-owners", "d-w", alice, alice_sign, bob, nonce=3).status_code
+        == 200
+    )
+    assert client.get("/kv/room-owners/d-w").text.strip().endswith(bob)
+    assert client.get("/kv/room-allow/d-w").text.strip().endswith("none")
+
+    # Carol and Alice can no longer write
+    assert _say_signed(client, "d-w", carol, carol_sign, "carol after handover").status_code == 403
+    assert _say_signed(client, "d-w", alice, alice_sign, "alice after handover").status_code == 403
+    assert (
+        _say_signed(client, "d-w", stranger, stranger_sign, "stranger rejected").status_code == 403
+    )
+
+    # Bob (the new owner) can write
+    assert _say_signed(client, "d-w", bob, bob_sign, "bob room now").status_code == 200
+
+    # Bob can establish a fresh allow-list authorizing Dave
+    assert _set_signed(client, "room-allow", "d-w", bob, bob_sign, dave, nonce=4).status_code == 200
+    assert _say_signed(client, "d-w", dave, dave_sign, "dave allowed").status_code == 200
+    assert _say_signed(client, "d-w", carol, carol_sign, "carol still rejected").status_code == 403
+
+
+def test_an_ownership_handover_over_post_clears_sellers_allow_list(client):
+    """The POST lane for ownership handover resets the allow-list under the same owner lock."""
+    alice, alice_sign = _keypair(11)
+    carol, carol_sign = _keypair(12)
+    bob, bob_sign = _keypair(13)
+
+    assert _claim(client, "d-posthandover", alice, alice_sign).status_code == 200
+    allow_payload = _signed_note_payload(
+        "room-allow", "d-posthandover", alice, alice_sign, carol, nonce=2
+    )
+    assert client.post("/kv/room-allow/d-posthandover", json=allow_payload).status_code == 200
+    assert _say_signed(client, "d-posthandover", carol, carol_sign, "carol in").status_code == 200
+
+    handover_payload = _signed_note_payload(
+        "room-owners", "d-posthandover", alice, alice_sign, bob, nonce=3
+    )
+    assert client.post("/kv/room-owners/d-posthandover", json=handover_payload).status_code == 200
+    assert client.get("/kv/room-owners/d-posthandover").text.strip().endswith(bob)
+    assert client.get("/kv/room-allow/d-posthandover").text.strip().endswith("none")
+
+    assert (
+        _say_signed(client, "d-posthandover", carol, carol_sign, "carol blocked").status_code == 403
+    )
+    assert _say_signed(client, "d-posthandover", bob, bob_sign, "bob in").status_code == 200
+
+
+def test_ownership_handover_without_prior_allow_list_leaves_allow_note_absent(client):
+    """A handover on a room without an existing allow-list does not synthesize an empty one."""
+    alice, alice_sign = _keypair(14)
+    bob, bob_sign = _keypair(15)
+    stranger, stranger_sign = _keypair(16)
+
+    assert _claim(client, "d-noallow", alice, alice_sign).status_code == 200
+    assert (
+        _set_signed(client, "room-owners", "d-noallow", alice, alice_sign, bob, nonce=2).status_code
+        == 200
+    )
+    assert client.get("/kv/room-owners/d-noallow").text.strip().endswith(bob)
+    assert client.get("/kv/room-allow/d-noallow").status_code == 404
+    assert _say_signed(client, "d-noallow", bob, bob_sign, "bob writes").status_code == 200
+    assert (
+        _say_signed(client, "d-noallow", stranger, stranger_sign, "stranger blocked").status_code
+        == 403
+    )
+
+
 def test_an_allow_list_needs_an_owner_and_fails_closed_on_junk(client):
     owner, owner_sign = _keypair()
     r = _set_signed(client, "room-allow", "d-orphan", owner, owner_sign, owner)
