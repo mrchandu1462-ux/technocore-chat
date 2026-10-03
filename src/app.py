@@ -1162,9 +1162,8 @@ def _reject_if_events_room(room: str) -> Response | None:
 
 def _allowed_keys(room: str, owner: str) -> set[str]:
     """The keys an owned room accepts writes from: the owner plus /kv/room-allow/<room>."""
-    keys = {owner} if didkey.is_did(owner) else set()
-    allow = store.note_get(config.ROOT, store.ALLOW_NS, room) or ""
-    return keys | {k for k in allow.split() if didkey.is_did(k)}
+    allow = (store.note_get(config.ROOT, store.ALLOW_NS, room) or "").split()
+    return ({owner} if didkey.is_did(owner) else set()) | {k for k in allow if didkey.is_did(k)}
 
 
 def _room_write_gate(request: Request, room: str, signer: str | None) -> Response | None:
@@ -1634,23 +1633,6 @@ def _note_write_gate(ns: str, key: str, value: str, signer: str | None) -> Respo
                 "take over a conversation already in progress.",
                 403,
             )
-        # No owner, or a new owner receiving a handover: no allow-list here can be
-        # current because only the current owner's authorizations apply. The reaper retires
-        # an owner note on its own clock, and a handover transfers ownership to a new key —
-        # in both cases, any previous allow-list must not be inherited by the new owner.
-        # Emptied rather than deleted: `none` names no key, and overwriting keeps the note
-        # and its count, so the new owner's own list is an overwrite too — an unlink would
-        # leave the count one high and refuse it at a full namespace until the next reap.
-        # The room's nonce is left alone.
-        #
-        # Under the owner note's own lock, re-checked: a claim that raced this one and won
-        # writes its owner note under that lock, and can only write a list after it, so a
-        # claimant that read "no owner" before losing can never empty the winner's list.
-        with store._locked(path := store.note_path(config.ROOT, store.OWNERS_NS, key)):
-            if (not path.exists() or (signer == owner and owner != value)) and store.note_get(
-                config.ROOT, store.ALLOW_NS, key
-            ):
-                store.note_set(config.ROOT, store.ALLOW_NS, key, "none")
         return None
     if owner is None:
         return text(
@@ -1674,6 +1656,19 @@ def _note_write_gate(ns: str, key: str, value: str, signer: str | None) -> Respo
             400,
         )
     return None
+
+
+def _retire_room_allow(ns: str, key: str, old_owner: str | None, new_owner: str) -> None:
+    """Retire a previous owner's allow-list upon room claim or ownership handover.
+
+    An allow-list belongs to the owner who authorized it. A successful claim on an unowned
+    (or reaped) room or a handover to a new owner must not allow the old owner's grants to
+    survive. If an allow-list note exists, it is reset to 'none' (preserving note quota
+    accounting rather than unlinking). If no allow-list exists, no phantom note is created.
+    """
+    if ns == store.OWNERS_NS and old_owner != new_owner:
+        if store.note_get(config.ROOT, store.ALLOW_NS, key):
+            store.note_set(config.ROOT, store.ALLOW_NS, key, "none")
 
 
 def note_write(request: Request) -> Response:
@@ -1740,7 +1735,9 @@ def note_write_signed(request: Request) -> Response:
     denied = _burn_nonce(key, nonce)
     if denied:
         return denied
+    old_owner = store.note_get(config.ROOT, store.OWNERS_NS, key)
     meta = store.note_set(config.ROOT, ns, key, value, *condition)
+    _retire_room_allow(ns, key, old_owner, value)
     return respond(
         request,
         meta,
@@ -1783,7 +1780,9 @@ async def note_post(request: Request) -> Response:
             burned = _burn_nonce(key, nonce)
             if burned:
                 return burned
+        old_owner = store.note_get(config.ROOT, store.OWNERS_NS, key)
         meta = store.note_set(config.ROOT, ns, key, value, *condition)
+        _retire_room_allow(ns, key, old_owner, value)
         return respond(
             request,
             meta,

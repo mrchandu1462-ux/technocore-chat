@@ -979,6 +979,169 @@ def test_ownership_handover_without_prior_allow_list_leaves_allow_note_absent(cl
     )
 
 
+def test_failed_handover_due_to_spent_nonce_preserves_owner_and_grants(client):
+    """When an ownership handover fails because of a spent nonce (403), the current
+    owner remains owner and their existing allow-list grants remain fully functional."""
+    alice, alice_sign = _keypair(31)
+    carol, carol_sign = _keypair(32)
+    bob, _ = _keypair(33)
+
+    assert _claim(client, "d-spentnonce", alice, alice_sign).status_code == 200
+    assert (
+        _set_signed(
+            client, "room-allow", "d-spentnonce", alice, alice_sign, carol, nonce=2
+        ).status_code
+        == 200
+    )
+    assert _say_signed(client, "d-spentnonce", carol, carol_sign, "carol before").status_code == 200
+
+    # Alice attempts handover to Bob with spent nonce 1 (last was 2)
+    failed = _set_signed(client, "room-owners", "d-spentnonce", alice, alice_sign, bob, nonce=1)
+    assert failed.status_code == 403 and "already used" in failed.text
+
+    # Alice is still owner
+    assert client.get("/kv/room-owners/d-spentnonce").text.strip().endswith(alice)
+    # Allow list is preserved
+    assert client.get("/kv/room-allow/d-spentnonce").text.strip().endswith(carol)
+    # Carol can still write
+    assert (
+        _say_signed(
+            client, "d-spentnonce", carol, carol_sign, "carol still allowed", nonce=2
+        ).status_code
+        == 200
+    )
+    # Bob cannot write
+    assert (
+        _say_signed(client, "d-spentnonce", bob, _keypair(33)[1], "bob rejected").status_code == 403
+    )
+
+
+def test_failed_handover_due_to_failed_condition_preserves_owner_and_grants(client):
+    """When an ownership handover fails because of an if= condition conflict (409), the
+    current owner remains owner and their existing allow-list grants remain unchanged."""
+    alice, alice_sign = _keypair(41)
+    carol, carol_sign = _keypair(42)
+    bob, _ = _keypair(43)
+    stranger, _ = _keypair(44)
+
+    assert _claim(client, "d-badif", alice, alice_sign).status_code == 200
+    assert (
+        _set_signed(client, "room-allow", "d-badif", alice, alice_sign, carol, nonce=2).status_code
+        == 200
+    )
+    assert _say_signed(client, "d-badif", carol, carol_sign, "carol before").status_code == 200
+
+    # Alice attempts handover to Bob with condition if=<stranger> (does not match current owner)
+    handover_sig = alice_sign(f"room-owners|d-badif|3|{bob}")
+    url = f"/kv/room-owners/d-badif/set-signed/{alice}/{handover_sig}/3/{bob}?if={stranger}"
+    failed = client.get(url)
+    assert failed.status_code == 409
+
+    # Alice is still owner
+    assert client.get("/kv/room-owners/d-badif").text.strip().endswith(alice)
+    # Allow list is preserved
+    assert client.get("/kv/room-allow/d-badif").text.strip().endswith(carol)
+    # Carol can still write
+    assert (
+        _say_signed(
+            client, "d-badif", carol, carol_sign, "carol still allowed", nonce=2
+        ).status_code
+        == 200
+    )
+
+
+def test_failed_handover_due_to_storage_error_preserves_owner_and_grants(client, monkeypatch):
+    """When an ownership handover fails due to an I/O error during the owner note write,
+    the current owner and existing allow-list grants remain intact."""
+    import errno
+
+    import pytest
+
+    import store
+
+    alice, alice_sign = _keypair(51)
+    carol, carol_sign = _keypair(52)
+    bob, _ = _keypair(53)
+
+    assert _claim(client, "d-ioerr", alice, alice_sign).status_code == 200
+    assert (
+        _set_signed(client, "room-allow", "d-ioerr", alice, alice_sign, carol, nonce=2).status_code
+        == 200
+    )
+    assert _say_signed(client, "d-ioerr", carol, carol_sign, "carol before").status_code == 200
+
+    real_replace = store._replace
+
+    def fail_replace(path, data, fsync=False):
+        if "room-owners" in str(path) and "d-ioerr" in str(path):
+            raise OSError(errno.EIO, "Injected I/O error")
+        return real_replace(path, data, fsync=fsync)
+
+    monkeypatch.setattr(store, "_replace", fail_replace)
+
+    with pytest.raises(OSError):
+        _set_signed(client, "room-owners", "d-ioerr", alice, alice_sign, bob, nonce=3)
+
+    monkeypatch.setattr(store, "_replace", real_replace)
+
+    # Alice is still owner
+    assert client.get("/kv/room-owners/d-ioerr").text.strip().endswith(alice)
+    # Allow list is preserved
+    assert client.get("/kv/room-allow/d-ioerr").text.strip().endswith(carol)
+    # Carol can still write
+    assert (
+        _say_signed(
+            client, "d-ioerr", carol, carol_sign, "carol still allowed", nonce=2
+        ).status_code
+        == 200
+    )
+
+
+def test_failed_ownership_handover_over_post_preserves_owner_and_grants(client):
+    """Failed handover via POST (spent nonce or conflict) preserves current owner and grants."""
+    alice, alice_sign = _keypair(61)
+    carol, carol_sign = _keypair(62)
+    bob, _ = _keypair(63)
+    stranger, _ = _keypair(64)
+
+    assert _claim(client, "d-postfail", alice, alice_sign).status_code == 200
+    allow_payload = _signed_note_payload(
+        "room-allow", "d-postfail", alice, alice_sign, carol, nonce=2
+    )
+    assert client.post("/kv/room-allow/d-postfail", json=allow_payload).status_code == 200
+    assert _say_signed(client, "d-postfail", carol, carol_sign, "carol in").status_code == 200
+
+    # 1. Spent nonce over POST
+    bad_nonce_payload = _signed_note_payload(
+        "room-owners", "d-postfail", alice, alice_sign, bob, nonce=1
+    )
+    failed_nonce = client.post("/kv/room-owners/d-postfail", json=bad_nonce_payload)
+    assert failed_nonce.status_code == 403
+
+    assert client.get("/kv/room-owners/d-postfail").text.strip().endswith(alice)
+    assert client.get("/kv/room-allow/d-postfail").text.strip().endswith(carol)
+    assert (
+        _say_signed(client, "d-postfail", carol, carol_sign, "carol still in", nonce=2).status_code
+        == 200
+    )
+
+    # 2. Failed conditional over POST
+    bad_cond_payload = _signed_note_payload(
+        "room-owners", "d-postfail", alice, alice_sign, bob, nonce=3, **{"if": stranger}
+    )
+    failed_cond = client.post("/kv/room-owners/d-postfail", json=bad_cond_payload)
+    assert failed_cond.status_code == 409
+
+    assert client.get("/kv/room-owners/d-postfail").text.strip().endswith(alice)
+    assert client.get("/kv/room-allow/d-postfail").text.strip().endswith(carol)
+    assert (
+        _say_signed(
+            client, "d-postfail", carol, carol_sign, "carol still in 2", nonce=3
+        ).status_code
+        == 200
+    )
+
+
 def test_an_allow_list_needs_an_owner_and_fails_closed_on_junk(client):
     owner, owner_sign = _keypair()
     r = _set_signed(client, "room-allow", "d-orphan", owner, owner_sign, owner)
