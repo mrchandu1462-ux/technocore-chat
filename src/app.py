@@ -1658,17 +1658,24 @@ def _note_write_gate(ns: str, key: str, value: str, signer: str | None) -> Respo
     return None
 
 
-def _retire_room_allow(ns: str, key: str, old_owner: str | None, new_owner: str) -> None:
-    """Retire a previous owner's allow-list upon room claim or ownership handover.
+def _retire_room_allow(ns: str, key: str, value: str, condition: tuple[str | None, bool]) -> dict:
+    """Write a note, retiring any delegated allow-list before an ownership handover.
 
-    An allow-list belongs to the owner who authorized it. A successful claim on an unowned
-    (or reaped) room or a handover to a new owner must not allow the old owner's grants to
-    survive. If an allow-list note exists, it is reset to 'none' (preserving note quota
-    accounting rather than unlinking). If no allow-list exists, no phantom note is created.
+    An allow-list belongs to the owner who authorized it. Handing over ownership to a new
+    key must not allow the previous owner's grants to survive. Retiring the allow-list
+    before writing the new owner guarantees fail-closed semantics: under no failure can a
+    new owner inherit an active delegate list. If the owner write fails, the allow-list
+    remains retired. This intentionally leaves the room fail-closed rather than
+    restoring a potentially stale allow-list snapshot.
     """
-    if ns == store.OWNERS_NS and old_owner != new_owner:
-        if store.note_get(config.ROOT, store.ALLOW_NS, key):
-            store.note_set(config.ROOT, store.ALLOW_NS, key, "none")
+    if ns != store.OWNERS_NS or (cur := store.note_get(config.ROOT, ns, key)) == value:
+        return store.note_set(config.ROOT, ns, key, value, *condition)
+    expect, expect_absent = condition
+    if (expect_absent and cur is not None) or (expect is not None and cur != expect):
+        return store.note_set(config.ROOT, ns, key, value, *condition)
+    if (a := store.note_get(config.ROOT, store.ALLOW_NS, key)) and a != "none":
+        store.note_set(config.ROOT, store.ALLOW_NS, key, "none")
+    return store.note_set(config.ROOT, ns, key, value, *condition)
 
 
 def note_write(request: Request) -> Response:
@@ -1677,8 +1684,7 @@ def note_write(request: Request) -> Response:
         return limit.limited("write", RATE_WRITE, retry, text=text, max_wait=MAX_WAIT)
     p = request.path_params
     value = store.clean_text(p["value"], store.MAX_VALUE_CHARS)
-    denied = _note_write_gate(p["ns"], p["key"], value, None)
-    if denied:
+    if denied := _note_write_gate(p["ns"], p["key"], value, None):
         return denied
     meta = store.note_set(config.ROOT, p["ns"], p["key"], value, *_condition(request.query_params))
     return respond(
@@ -1728,16 +1734,10 @@ def note_write_signed(request: Request) -> Response:
     signer = _signer(p["did"], p["sig"], nonce, f"{ns}|{key}|{nonce}|{value}")
     if isinstance(signer, Response):
         return signer
-    denied = _note_write_gate(ns, key, value, signer)
-    if denied:
-        return denied
     condition = _condition(request.query_params)
-    denied = _burn_nonce(key, nonce)
-    if denied:
+    if (denied := _note_write_gate(ns, key, value, signer)) or (denied := _burn_nonce(key, nonce)):
         return denied
-    old_owner = store.note_get(config.ROOT, store.OWNERS_NS, key)
-    meta = store.note_set(config.ROOT, ns, key, value, *condition)
-    _retire_room_allow(ns, key, old_owner, value)
+    meta = _retire_room_allow(ns, key, value, condition)
     return respond(
         request,
         meta,
@@ -1773,16 +1773,11 @@ async def note_post(request: Request) -> Response:
     # note, the nonce burn is a compare-and-swap on disk, and note_set walks the notes tree
     # to enforce the global cap. None of that may run on the loop from an `async def`.
     def write() -> Response:
-        denied = _note_write_gate(ns, key, value, signer)
-        if denied:
+        if (denied := _note_write_gate(ns, key, value, signer)) or (
+            signer is not None and (denied := _burn_nonce(key, nonce))
+        ):
             return denied
-        if signer is not None:
-            burned = _burn_nonce(key, nonce)
-            if burned:
-                return burned
-        old_owner = store.note_get(config.ROOT, store.OWNERS_NS, key)
-        meta = store.note_set(config.ROOT, ns, key, value, *condition)
-        _retire_room_allow(ns, key, old_owner, value)
+        meta = _retire_room_allow(ns, key, value, condition)
         return respond(
             request,
             meta,

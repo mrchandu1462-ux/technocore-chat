@@ -1050,9 +1050,10 @@ def test_failed_handover_due_to_failed_condition_preserves_owner_and_grants(clie
     )
 
 
-def test_failed_handover_due_to_storage_error_preserves_owner_and_grants(client, monkeypatch):
+def test_failed_handover_due_to_owner_write_error_fails_closed(client, monkeypatch):
     """When an ownership handover fails due to an I/O error during the owner note write,
-    the current owner and existing allow-list grants remain intact."""
+    the room fails closed: the old owner remains, the allow-list remains 'none', and
+    delegates cannot write."""
     import errno
 
     import pytest
@@ -1063,42 +1064,254 @@ def test_failed_handover_due_to_storage_error_preserves_owner_and_grants(client,
     carol, carol_sign = _keypair(52)
     bob, _ = _keypair(53)
 
-    assert _claim(client, "d-ioerr", alice, alice_sign).status_code == 200
+    assert _claim(client, "d-failclosed", alice, alice_sign).status_code == 200
     assert (
-        _set_signed(client, "room-allow", "d-ioerr", alice, alice_sign, carol, nonce=2).status_code
+        _set_signed(
+            client, "room-allow", "d-failclosed", alice, alice_sign, carol, nonce=2
+        ).status_code
         == 200
     )
-    assert _say_signed(client, "d-ioerr", carol, carol_sign, "carol before").status_code == 200
+    assert _say_signed(client, "d-failclosed", carol, carol_sign, "carol before").status_code == 200
 
     real_replace = store._replace
 
     def fail_replace(path, data, fsync=False):
-        if "room-owners" in str(path) and "d-ioerr" in str(path):
-            raise OSError(errno.EIO, "Injected I/O error")
+        if "room-owners" in str(path) and "d-failclosed" in str(path):
+            raise OSError(errno.EIO, "Injected owner write error")
         return real_replace(path, data, fsync=fsync)
 
     monkeypatch.setattr(store, "_replace", fail_replace)
 
     with pytest.raises(OSError):
-        _set_signed(client, "room-owners", "d-ioerr", alice, alice_sign, bob, nonce=3)
+        _set_signed(client, "room-owners", "d-failclosed", alice, alice_sign, bob, nonce=3)
+
+    monkeypatch.setattr(store, "_replace", real_replace)
+
+    # Alice is still owner (not Bob)
+    assert client.get("/kv/room-owners/d-failclosed").text.strip().endswith(alice)
+    # Allow list is retired to "none" (fail-closed: no compensating restore)
+    assert client.get("/kv/room-allow/d-failclosed").text.strip().endswith("none")
+    # Carol cannot write
+    assert (
+        _say_signed(client, "d-failclosed", carol, carol_sign, "carol blocked", nonce=2).status_code
+        == 403
+    )
+    # Alice can still write as owner
+    assert (
+        _say_signed(client, "d-failclosed", alice, alice_sign, "alice writes", nonce=4).status_code
+        == 200
+    )
+
+
+def test_failed_handover_due_to_allow_retirement_error_preserves_owner_and_grants(
+    client, monkeypatch
+):
+    """When allow-list retirement itself fails with an I/O error, the handover is aborted
+    before the owner note is modified, preserving the current owner and allow-list."""
+    import errno
+
+    import pytest
+
+    import store
+
+    alice, alice_sign = _keypair(71)
+    carol, carol_sign = _keypair(72)
+    bob, _ = _keypair(73)
+
+    assert _claim(client, "d-retirefail", alice, alice_sign).status_code == 200
+    assert (
+        _set_signed(
+            client, "room-allow", "d-retirefail", alice, alice_sign, carol, nonce=2
+        ).status_code
+        == 200
+    )
+    assert _say_signed(client, "d-retirefail", carol, carol_sign, "carol before").status_code == 200
+
+    real_replace = store._replace
+
+    def fail_replace(path, data, fsync=False):
+        if "room-allow" in str(path) and "d-retirefail" in str(path) and data == b"none":
+            raise OSError(errno.EIO, "Injected retirement error")
+        return real_replace(path, data, fsync=fsync)
+
+    monkeypatch.setattr(store, "_replace", fail_replace)
+
+    with pytest.raises(OSError):
+        _set_signed(client, "room-owners", "d-retirefail", alice, alice_sign, bob, nonce=3)
 
     monkeypatch.setattr(store, "_replace", real_replace)
 
     # Alice is still owner
-    assert client.get("/kv/room-owners/d-ioerr").text.strip().endswith(alice)
-    # Allow list is preserved
-    assert client.get("/kv/room-allow/d-ioerr").text.strip().endswith(carol)
+    assert client.get("/kv/room-owners/d-retirefail").text.strip().endswith(alice)
+    # Allow list remains intact
+    assert client.get("/kv/room-allow/d-retirefail").text.strip().endswith(carol)
     # Carol can still write
     assert (
         _say_signed(
-            client, "d-ioerr", carol, carol_sign, "carol still allowed", nonce=2
+            client, "d-retirefail", carol, carol_sign, "carol still allowed", nonce=2
         ).status_code
         == 200
     )
 
 
-def test_failed_ownership_handover_over_post_preserves_owner_and_grants(client):
-    """Failed handover via POST (spent nonce or conflict) preserves current owner and grants."""
+def test_same_owner_rewrite_preserves_allow_list(client):
+    """Writing the owner note with the same owner does not retire or alter the allow-list."""
+    alice, alice_sign = _keypair(91)
+    carol, carol_sign = _keypair(92)
+
+    assert _claim(client, "d-sameowner", alice, alice_sign).status_code == 200
+    assert (
+        _set_signed(
+            client, "room-allow", "d-sameowner", alice, alice_sign, carol, nonce=2
+        ).status_code
+        == 200
+    )
+    assert _say_signed(client, "d-sameowner", carol, carol_sign, "carol in").status_code == 200
+
+    # Alice rewrites her own owner note
+    assert (
+        _set_signed(
+            client, "room-owners", "d-sameowner", alice, alice_sign, alice, nonce=3
+        ).status_code
+        == 200
+    )
+    assert client.get("/kv/room-owners/d-sameowner").text.strip().endswith(alice)
+    assert client.get("/kv/room-allow/d-sameowner").text.strip().endswith(carol)
+    assert (
+        _say_signed(
+            client, "d-sameowner", carol, carol_sign, "carol still allowed", nonce=2
+        ).status_code
+        == 200
+    )
+
+
+def test_concurrent_handovers_prevent_stale_allow_resurrection(client, monkeypatch):
+    """When a handover fails during owner persistence, it must never restore a stale
+    allow-list snapshot over a concurrent successful handover."""
+    import errno
+
+    import pytest
+
+    import store
+
+    alice, alice_sign = _keypair(101)
+    carol, carol_sign = _keypair(102)
+    bob, _ = _keypair(103)
+    dave, dave_sign = _keypair(104)
+
+    assert _claim(client, "d-concur", alice, alice_sign).status_code == 200
+    assert (
+        _set_signed(client, "room-allow", "d-concur", alice, alice_sign, carol, nonce=2).status_code
+        == 200
+    )
+    assert _say_signed(client, "d-concur", carol, carol_sign, "carol initial").status_code == 200
+
+    real_replace = store._replace
+
+    # Interleaving simulation: Handover 1 (Alice -> Bob) retires allow-list, but fails owner write.
+    # Meanwhile, Handover 2 (Alice -> Dave) succeeds.
+    def fail_bob_owner_replace(path, data, fsync=False):
+        if "room-owners" in str(path) and "d-concur" in str(path) and data == bob.encode():
+            # Before failing Bob's write, Handover 2 (Alice -> Dave) runs to completion
+            monkeypatch.setattr(store, "_replace", real_replace)
+            h2_res = _set_signed(
+                client, "room-owners", "d-concur", alice, alice_sign, dave, nonce=4
+            )
+            assert h2_res.status_code == 200
+            # Now fail Bob's owner write
+            raise OSError(errno.EIO, "Injected failure for Bob owner write")
+        return real_replace(path, data, fsync=fsync)
+
+    monkeypatch.setattr(store, "_replace", fail_bob_owner_replace)
+
+    # Run Handover 1 (Alice -> Bob)
+    with pytest.raises(OSError):
+        _set_signed(client, "room-owners", "d-concur", alice, alice_sign, bob, nonce=3)
+
+    monkeypatch.setattr(store, "_replace", real_replace)
+
+    # Final state: Dave is owner, allow-list is NOT resurrected to Carol
+    assert client.get("/kv/room-owners/d-concur").text.strip().endswith(dave)
+    assert client.get("/kv/room-allow/d-concur").text.strip().endswith("none")
+    # Carol's authorization is gone
+    assert (
+        _say_signed(client, "d-concur", carol, carol_sign, "carol should fail", nonce=2).status_code
+        == 403
+    )
+    # Dave is valid owner
+    assert (
+        _say_signed(client, "d-concur", dave, dave_sign, "dave can speak", nonce=1).status_code
+        == 200
+    )
+
+
+def test_concurrent_delegate_update_not_overwritten_by_failed_handover(client, monkeypatch):
+    """A failed handover must not overwrite a newer delegate grant with a stale allow-list snapshot."""
+    import errno
+
+    import pytest
+
+    import store
+
+    alice, alice_sign = _keypair(111)
+    carol, carol_sign = _keypair(112)
+    bob, _ = _keypair(113)
+    eve, eve_sign = _keypair(114)
+
+    assert _claim(client, "d-concur-grant", alice, alice_sign).status_code == 200
+    assert (
+        _set_signed(
+            client, "room-allow", "d-concur-grant", alice, alice_sign, carol, nonce=2
+        ).status_code
+        == 200
+    )
+
+    real_replace = store._replace
+
+    # Handover 1 (Alice -> Bob) retires allow-list, but before owner write fails,
+    # Alice issues a new allow-list grant to Eve.
+    def fail_handover_after_grant(path, data, fsync=False):
+        if "room-owners" in str(path) and "d-concur-grant" in str(path):
+            monkeypatch.setattr(store, "_replace", real_replace)
+            # Alice grants Eve
+            g_res = _set_signed(
+                client, "room-allow", "d-concur-grant", alice, alice_sign, eve, nonce=4
+            )
+            assert g_res.status_code == 200
+            # Now fail Bob's owner write
+            raise OSError(errno.EIO, "Injected failure for Bob owner write")
+        return real_replace(path, data, fsync=fsync)
+
+    monkeypatch.setattr(store, "_replace", fail_handover_after_grant)
+
+    with pytest.raises(OSError):
+        _set_signed(client, "room-owners", "d-concur-grant", alice, alice_sign, bob, nonce=3)
+
+    monkeypatch.setattr(store, "_replace", real_replace)
+
+    # Alice remains owner, Eve's grant is preserved and Carol is not resurrected
+    assert client.get("/kv/room-owners/d-concur-grant").text.strip().endswith(alice)
+    assert client.get("/kv/room-allow/d-concur-grant").text.strip().endswith(eve)
+    assert (
+        _say_signed(client, "d-concur-grant", eve, eve_sign, "eve allowed", nonce=2).status_code
+        == 200
+    )
+    assert (
+        _say_signed(
+            client, "d-concur-grant", carol, carol_sign, "carol blocked", nonce=2
+        ).status_code
+        == 403
+    )
+
+
+def test_failed_ownership_handover_over_post_fails_closed_on_storage_error(client, monkeypatch):
+    """Failed handover via POST preserves owner on validation failure and fails closed on storage error."""
+    import errno
+
+    import pytest
+
+    import store
+
     alice, alice_sign = _keypair(61)
     carol, carol_sign = _keypair(62)
     bob, _ = _keypair(63)
@@ -1111,7 +1324,7 @@ def test_failed_ownership_handover_over_post_preserves_owner_and_grants(client):
     assert client.post("/kv/room-allow/d-postfail", json=allow_payload).status_code == 200
     assert _say_signed(client, "d-postfail", carol, carol_sign, "carol in").status_code == 200
 
-    # 1. Spent nonce over POST
+    # 1. Spent nonce over POST -> validation failure before allow retirement -> grants preserved
     bad_nonce_payload = _signed_note_payload(
         "room-owners", "d-postfail", alice, alice_sign, bob, nonce=1
     )
@@ -1125,7 +1338,7 @@ def test_failed_ownership_handover_over_post_preserves_owner_and_grants(client):
         == 200
     )
 
-    # 2. Failed conditional over POST
+    # 2. Failed conditional over POST -> validation failure before allow retirement -> grants preserved
     bad_cond_payload = _signed_note_payload(
         "room-owners", "d-postfail", alice, alice_sign, bob, nonce=3, **{"if": stranger}
     )
@@ -1138,6 +1351,36 @@ def test_failed_ownership_handover_over_post_preserves_owner_and_grants(client):
         _say_signed(
             client, "d-postfail", carol, carol_sign, "carol still in 2", nonce=3
         ).status_code
+        == 200
+    )
+
+    # 3. Storage error during owner write over POST -> allow retired, fail-closed
+    real_replace = store._replace
+
+    def fail_replace(path, data, fsync=False):
+        if "room-owners" in str(path) and "d-postfail" in str(path):
+            raise OSError(errno.EIO, "Injected POST I/O error")
+        return real_replace(path, data, fsync=fsync)
+
+    monkeypatch.setattr(store, "_replace", fail_replace)
+
+    handover_payload = _signed_note_payload(
+        "room-owners", "d-postfail", alice, alice_sign, bob, nonce=4
+    )
+    with pytest.raises(OSError):
+        client.post("/kv/room-owners/d-postfail", json=handover_payload)
+
+    monkeypatch.setattr(store, "_replace", real_replace)
+
+    # Alice is still owner; allow list remains retired to "none"
+    assert client.get("/kv/room-owners/d-postfail").text.strip().endswith(alice)
+    assert client.get("/kv/room-allow/d-postfail").text.strip().endswith("none")
+    assert (
+        _say_signed(client, "d-postfail", carol, carol_sign, "carol blocked", nonce=4).status_code
+        == 403
+    )
+    assert (
+        _say_signed(client, "d-postfail", alice, alice_sign, "alice writes", nonce=5).status_code
         == 200
     )
 
